@@ -1,0 +1,356 @@
+Option Explicit On
+' Printable thread placement for Autodesk Inventor.
+' Native circle/extrude/coil features; shared user parameters per placement batch.
+' Basic single-start 60-degree flat-root printable profile, not an ISO tolerance class.
+' Female holes include a one-pitch entry relief at the effective major diameter; pilot depth is L + P.
+' Select a face-based planar sketch containing hole-center points, then run this rule.
+' Silent test arguments: SketchName, Mode ("Female" or "Male"), Diameter, Pitch,
+' Length, Clearance, Prefix, Silent=True. Length arguments are mm unless units are given.
+' No part is saved by this rule. A failed batch is rolled back as one transaction.
+
+Sub Main()
+    Dim silent As Boolean = False
+    If RuleArguments.Exists("Silent") Then silent = CBool(RuleArguments("Silent"))
+    Dim transaction As Inventor.Transaction = Nothing
+    Try
+        Dim document As Inventor.PartDocument = TryCast(ThisDoc.Document, Inventor.PartDocument)
+        If document Is Nothing Then Throw New Exception("Open a part document before running this rule.")
+        Dim partDef As Inventor.PartComponentDefinition = document.ComponentDefinition
+        Dim solidCount As Integer = 0
+        For Each body As Inventor.SurfaceBody In partDef.SurfaceBodies
+            If body.IsSolid Then solidCount += 1
+        Next
+        If solidCount <> 1 Then Throw New Exception("This rule requires exactly one solid body.")
+
+        Dim placement As Inventor.PlanarSketch = Nothing
+        If RuleArguments.Exists("SketchName") Then
+            placement = partDef.Sketches.Item(CStr(RuleArguments("SketchName")))
+        Else
+            For Each selected As Object In document.SelectSet
+                If TypeOf selected Is Inventor.PlanarSketch Then
+                    placement = CType(selected, Inventor.PlanarSketch)
+                    Exit For
+                End If
+            Next
+            If placement Is Nothing Then
+                If silent Then Throw New Exception("Silent mode requires SketchName or a preselected planar sketch.")
+                placement = TryCast(ThisApplication.CommandManager.Pick(
+                    Inventor.SelectionFilterEnum.kSketchObjectFilter,
+                    "Select the face sketch containing your thread center points"), Inventor.PlanarSketch)
+            End If
+        End If
+        If placement Is Nothing Then Return
+        Dim hostFace As Inventor.Face = TryCast(placement.PlanarEntity, Inventor.Face)
+        If hostFace Is Nothing OrElse hostFace.SurfaceType <> Inventor.SurfaceTypeEnum.kPlaneSurface Then
+            Throw New Exception("Create the placement sketch directly on a planar face of the solid.")
+        End If
+
+        Dim centers As New System.Collections.Generic.List(Of Inventor.SketchPoint)
+        For Each point As Inventor.SketchPoint In placement.SketchPoints
+            If point.HoleCenter AndAlso Not point.Reference Then centers.Add(point)
+        Next
+        If centers.Count = 0 Then Throw New Exception("The selected sketch has no non-reference hole-center points.")
+
+        Dim mode As String
+        If RuleArguments.Exists("Mode") Then
+            mode = CStr(RuleArguments("Mode"))
+        Else
+            If silent Then Throw New Exception("Silent mode requires Mode.")
+            mode = CStr(InputListBox("Choose the feature to place at every center point.",
+                New String() {"Female hole", "Male stud"}, "Female hole", "Printable threads", "Thread type"))
+            If String.IsNullOrWhiteSpace(mode) Then Return
+        End If
+        Dim female As Boolean
+        If mode.Trim().StartsWith("Female", StringComparison.OrdinalIgnoreCase) Then
+            female = True
+        ElseIf mode.Trim().StartsWith("Male", StringComparison.OrdinalIgnoreCase) Then
+            female = False
+        Else
+            Throw New Exception("Mode must be Female or Male.")
+        End If
+
+        Dim diameterExpression As String = ReadLengthInput("Diameter", "Nominal major diameter in mm", "12 mm", silent)
+        Dim pitchExpression As String = ReadLengthInput("Pitch", "Thread pitch in mm", "1.75 mm", silent)
+        Dim lengthExpression As String = ReadLengthInput("Length",
+            If(female, "Thread travel in mm; pilot depth is Length + Pitch; entry relief is one Pitch", "Stud height in mm"), "12 mm", silent)
+        Dim clearanceExpression As String = ReadLengthInput("Clearance",
+            "Radial clearance in mm: positive enlarges a female hole or shrinks a male stud." & vbCrLf &
+            "Use clearance on one mating part only unless you want the two clearances to add.",
+            If(female, "0.15 mm", "0 mm"), silent)
+        Dim units As Inventor.UnitsOfMeasure = document.UnitsOfMeasure
+        Dim diameter As Double = units.GetValueFromExpression(diameterExpression, "mm")
+        Dim pitch As Double = units.GetValueFromExpression(pitchExpression, "mm")
+        Dim length As Double = units.GetValueFromExpression(lengthExpression, "mm")
+        Dim clearance As Double = units.GetValueFromExpression(clearanceExpression, "mm")
+        If diameter <= 0 OrElse pitch <= 0 OrElse length <= 0 OrElse clearance < 0 Then
+            Throw New Exception("Diameter, Pitch and Length must be positive; Clearance must be zero or positive.")
+        End If
+        If length < pitch Then Throw New Exception("Use Length of at least one Pitch.")
+        If diameter / 2 - 0.5512658773652742 * pitch - clearance <= 0 Then
+            Throw New Exception("Diameter is too small for this Pitch and Clearance.")
+        End If
+
+        Dim prefix As String
+        If RuleArguments.Exists("Prefix") Then
+            prefix = CStr(RuleArguments("Prefix")).Trim()
+        Else
+            prefix = NextPrefix(partDef.Parameters)
+        End If
+        If Not System.Text.RegularExpressions.Regex.IsMatch(prefix, "^[A-Za-z][A-Za-z0-9_]*$") Then
+            Throw New Exception("Prefix must begin with a letter and contain only letters, digits and underscores.")
+        End If
+        Dim suffixes As String() = {"_D", "_P", "_L", "_C", "_H", "_E", "_Rmajor", "_Rminor"}
+        For Each suffix As String In suffixes
+            If ParameterExists(partDef.Parameters, prefix & suffix) Then
+                Throw New Exception("Parameter prefix " & prefix & " already exists. Use a different Prefix.")
+            End If
+        Next
+
+        transaction = ThisApplication.TransactionManager.StartTransaction(document, "Place printable threads")
+        AddLengthParameter(partDef, prefix & "_D", MillimeterLiteral(diameter), "Nominal major diameter")
+        AddLengthParameter(partDef, prefix & "_P", MillimeterLiteral(pitch), "Pitch; single-start right-hand thread")
+        AddLengthParameter(partDef, prefix & "_L", MillimeterLiteral(length),
+            If(female, "Thread travel; pilot depth L + P, one-pitch entry relief", "Stud height"))
+        AddLengthParameter(partDef, prefix & "_C", MillimeterLiteral(clearance),
+            "Radial clearance; female grows, male shrinks. Mating clearances add.")
+        AddLengthParameter(partDef, prefix & "_H", "sqrt(3) / 2 * " & prefix & "_P",
+            "Fundamental 60-degree triangle height")
+        AddLengthParameter(partDef, prefix & "_E", "0.01 * " & prefix & "_P",
+            "Cutter overlap; preserves 60-degree flanks")
+        AddLengthParameter(partDef, prefix & "_Rmajor",
+            prefix & "_D / 2 " & If(female, "+ ", "- ") & prefix & "_C", "Effective major radius")
+        AddLengthParameter(partDef, prefix & "_Rminor",
+            prefix & "_Rmajor - 5 / 8 * " & prefix & "_H", "Basic flat-root minor radius")
+
+        Dim tg As Inventor.TransientGeometry = ThisApplication.TransientGeometry
+        Dim outward As Inventor.UnitVector = CType(hostFace.Geometry, Inventor.Plane).Normal
+        If hostFace.IsParamReversed Then outward = tg.CreateUnitVector(-outward.X, -outward.Y, -outward.Z)
+        Dim features As New System.Collections.Generic.List(Of Inventor.PartFeature)
+        Dim count As Integer = 0
+        For Each center As Inventor.SketchPoint In centers
+            count += 1
+            BuildOneThread(partDef, placement, hostFace, center, outward, female, prefix,
+                count, features, tg, document.UnitsOfMeasure)
+        Next
+        If Not document.Update2(False) Then Throw New Exception("Inventor could not recompute the thread geometry.")
+        For Each createdFeature As Inventor.PartFeature In features
+            If createdFeature.HealthStatus <> Inventor.HealthStatusEnum.kUpToDateHealth Then
+                Throw New Exception("Feature is not healthy after recompute: " & createdFeature.Name)
+            End If
+        Next
+        placement.Visible = False
+        transaction.End()
+        transaction = Nothing
+        If Not silent Then
+            MsgBox("Created " & count.ToString() & " " & If(female, "female thread(s)", "male stud(s)") & "." &
+                vbCrLf & vbCrLf & "Manage > Parameters: edit " & prefix & "_D, _P, _L and _C." &
+                vbCrLf & "Move the points in " & placement.Name & " to reposition the threads." &
+                vbCrLf & If(female, "Pilot depth is L + P. Entry relief is one pitch deep at the major diameter.",
+                    "Stud height is L. The thread begins just above the supporting face.") &
+                vbCrLf & "The part has not been saved.", MsgBoxStyle.Information, "Printable threads")
+        End If
+    Catch canceled As OperationCanceledException
+        If transaction IsNot Nothing Then transaction.Abort()
+        If silent Then Throw
+    Catch failure As Exception
+        If transaction IsNot Nothing Then
+            Try
+                transaction.Abort()
+            Catch
+            End Try
+        End If
+        If silent Then Throw
+        MsgBox("No threads were added; the batch was rolled back." & vbCrLf & vbCrLf &
+            failure.Message, MsgBoxStyle.Exclamation, "Printable threads")
+    End Try
+End Sub
+
+Function ReadLengthInput(argumentName As String, prompt As String, defaultValue As String, silent As Boolean) As String
+    If RuleArguments.Exists(argumentName) Then Return CStr(RuleArguments(argumentName))
+    If silent Then Throw New Exception("Silent mode requires " & argumentName & ".")
+    Dim value As String = InputBox(prompt, "Printable threads - " & argumentName, defaultValue).Trim()
+    If value = "" Then Throw New OperationCanceledException()
+    Return value
+End Function
+
+Function MillimeterLiteral(valueInCentimeters As Double) As String
+    Return (valueInCentimeters * 10).ToString("G17", System.Globalization.CultureInfo.InvariantCulture) & " mm"
+End Function
+
+Function ParameterExists(parameters As Inventor.Parameters, name As String) As Boolean
+    Try
+        Dim found As Inventor.Parameter = parameters.Item(name)
+        Return True
+    Catch
+        Return False
+    End Try
+End Function
+
+Function NextPrefix(parameters As Inventor.Parameters) As String
+    Dim index As Integer = 1
+    Do
+        Dim name As String = "PT" & index.ToString("00")
+        If Not ParameterExists(parameters, name & "_D") Then Return name
+        index += 1
+    Loop
+End Function
+
+Sub AddLengthParameter(partDef As Inventor.PartComponentDefinition, name As String,
+        expression As String, comment As String)
+    Dim userParam As Inventor.UserParameter = partDef.Parameters.UserParameters.AddByExpression(
+        name, expression, Inventor.UnitsTypeEnum.kMillimeterLengthUnits)
+    userParam.Comment = comment
+End Sub
+
+Sub BuildOneThread(partDef As Inventor.PartComponentDefinition, placement As Inventor.PlanarSketch,
+        hostFace As Inventor.Face, center As Inventor.SketchPoint, outward As Inventor.UnitVector,
+        female As Boolean, prefix As String, number As Integer,
+        created As System.Collections.Generic.List(Of Inventor.PartFeature),
+        tg As Inventor.TransientGeometry, units As Inventor.UnitsOfMeasure)
+    Dim tag As String = prefix & "_" & number.ToString("00")
+    Dim p As Double = partDef.Parameters.Item(prefix & "_P").Value
+    Dim rmajor As Double = partDef.Parameters.Item(prefix & "_Rmajor").Value
+    Dim rminor As Double = partDef.Parameters.Item(prefix & "_Rminor").Value
+    Dim overlap As Double = partDef.Parameters.Item(prefix & "_E").Value
+    Dim c As Inventor.Point2d = center.Geometry
+
+    ' A construction line follows the actual placement point. It never references the part origin.
+    Dim radialLine As Inventor.SketchLine = placement.SketchLines.AddByTwoPoints(
+        center, tg.CreatePoint2d(c.X + p, c.Y))
+    radialLine.Construction = True
+    radialLine.EndSketchPoint.HoleCenter = False
+    placement.GeometricConstraints.AddHorizontal(radialLine)
+    Dim radialDimension As Inventor.TwoPointDistanceDimConstraint =
+        placement.DimensionConstraints.AddTwoPointDistance(radialLine.StartSketchPoint, radialLine.EndSketchPoint,
+            Inventor.DimensionOrientationEnum.kAlignedDim, tg.CreatePoint2d(c.X + p / 2, c.Y + p / 3), False)
+    radialDimension.Parameter.Expression = prefix & "_P"
+
+    Dim axis As Inventor.WorkAxis = partDef.WorkAxes.AddByNormalToSurface(placement, center, False)
+    axis.Name = tag & "_Axis"
+    axis.Visible = False
+    Dim axisOutward As Boolean = axis.Line.Direction.DotProduct(outward) > 0
+    Dim axialPlane As Inventor.WorkPlane = partDef.WorkPlanes.AddByLinePlaneAndAngle(
+        radialLine, placement, "90 deg", False)
+    axialPlane.Name = tag & "_AxialPlane"
+    axialPlane.Visible = False
+
+    ' A separate circular sketch keeps each extrusion's profile independent of other centers.
+    Dim circularSketch As Inventor.PlanarSketch = partDef.Sketches.AddWithOrientation(
+        hostFace, radialLine, True, True, center, False)
+    circularSketch.Name = tag & If(female, "_PilotSketch", "_StudSketch")
+    Dim circleOrigin As Inventor.SketchPoint = CType(circularSketch.AddByProjectingEntity(center), Inventor.SketchPoint)
+    Dim radius As Double = If(female, rminor, rmajor)
+    Dim circle As Inventor.SketchCircle = circularSketch.SketchCircles.AddByCenterRadius(circleOrigin, radius)
+    Dim diameterDimension As Inventor.DiameterDimConstraint = circularSketch.DimensionConstraints.AddDiameter(
+        circle, tg.CreatePoint2d(radius * 1.3, radius * 1.3), False)
+    diameterDimension.Parameter.Expression = "2 * " & prefix & If(female, "_Rminor", "_Rmajor")
+    Dim circleNormal As Inventor.UnitVector = SketchNormal(circularSketch, tg)
+    Dim circlePointsOutward As Boolean = circleNormal.DotProduct(outward) > 0
+    Dim extrudePositive As Boolean = If(female, Not circlePointsOutward, circlePointsOutward)
+    ' Prepare the entry sketch while the original host face is still intact.
+    Dim entrySketch As Inventor.PlanarSketch = Nothing
+    If female Then
+        entrySketch = partDef.Sketches.AddWithOrientation(hostFace, radialLine, True, True, center, False)
+        entrySketch.Name = tag & "_EntrySketch"
+        Dim entryOrigin As Inventor.SketchPoint = CType(entrySketch.AddByProjectingEntity(center), Inventor.SketchPoint)
+        Dim entryCircle As Inventor.SketchCircle = entrySketch.SketchCircles.AddByCenterRadius(entryOrigin, rmajor)
+        Dim entryDiameter As Inventor.DiameterDimConstraint = entrySketch.DimensionConstraints.AddDiameter(
+            entryCircle, tg.CreatePoint2d(rmajor * 1.3, rmajor * 1.3), False)
+        entryDiameter.Parameter.Expression = "2 * " & prefix & "_Rmajor"
+        entrySketch.Visible = False
+    End If
+    Dim extrudeDefinition As Inventor.ExtrudeDefinition = partDef.Features.ExtrudeFeatures.CreateExtrudeDefinition(
+        circularSketch.Profiles.AddForSolid(), If(female, Inventor.PartFeatureOperationEnum.kCutOperation,
+            Inventor.PartFeatureOperationEnum.kJoinOperation))
+    extrudeDefinition.SetDistanceExtent(prefix & If(female, "_L + " & prefix & "_P", "_L"),
+        If(extrudePositive, Inventor.PartFeatureExtentDirectionEnum.kPositiveExtentDirection,
+            Inventor.PartFeatureExtentDirectionEnum.kNegativeExtentDirection))
+    Dim cylinder As Inventor.ExtrudeFeature = partDef.Features.ExtrudeFeatures.Add(extrudeDefinition)
+    cylinder.Name = tag & If(female, "_Pilot", "_Stud")
+    created.Add(cylinder)
+    circularSketch.Visible = False
+
+    ' Local +Y follows the thread depth: inward for female, outward for male.
+    Dim naturalDepth As Boolean = If(female, Not axisOutward, axisOutward)
+    Dim threadSketch As Inventor.PlanarSketch = partDef.Sketches.AddWithOrientation(
+        axialPlane, axis, naturalDepth, False, center, False)
+    threadSketch.Name = tag & "_ThreadProfile"
+    Dim origin As Inventor.SketchPoint = CType(threadSketch.AddByProjectingEntity(center), Inventor.SketchPoint)
+    Dim xExpressions As String()
+    Dim yExpressions As String()
+    If female Then
+        xExpressions = New String() {prefix & "_Rminor - " & prefix & "_E", prefix & "_Rmajor",
+            prefix & "_Rmajor", prefix & "_Rminor - " & prefix & "_E"}
+        yExpressions = New String() {prefix & "_P / 2 - 3 * " & prefix & "_P / 8 - " & prefix & "_E / sqrt(3)",
+            prefix & "_P / 2 - " & prefix & "_P / 16",
+            prefix & "_P / 2 + " & prefix & "_P / 16",
+            prefix & "_P / 2 + 3 * " & prefix & "_P / 8 + " & prefix & "_E / sqrt(3)"}
+    Else
+        xExpressions = New String() {prefix & "_Rminor", prefix & "_Rmajor + " & prefix & "_E",
+            prefix & "_Rmajor + " & prefix & "_E", prefix & "_Rminor"}
+        yExpressions = New String() {prefix & "_P / 2 - " & prefix & "_P / 8",
+            prefix & "_P / 2 - 7 * " & prefix & "_P / 16 - " & prefix & "_E / sqrt(3)",
+            prefix & "_P / 2 + 7 * " & prefix & "_P / 16 + " & prefix & "_E / sqrt(3)",
+            prefix & "_P / 2 + " & prefix & "_P / 8"}
+    End If
+    Dim vertices As New System.Collections.Generic.List(Of Inventor.SketchPoint)
+    For i As Integer = 0 To 3
+        Dim x As Double = units.GetValueFromExpression(xExpressions(i), "mm")
+        Dim y As Double = units.GetValueFromExpression(yExpressions(i), "mm")
+        Dim vertex As Inventor.SketchPoint = threadSketch.SketchPoints.Add(tg.CreatePoint2d(x, y), False)
+        vertices.Add(vertex)
+    Next
+    Dim profileLines As New System.Collections.Generic.List(Of Inventor.SketchLine)
+    For i As Integer = 0 To 3
+        profileLines.Add(threadSketch.SketchLines.AddByTwoPoints(vertices(i), vertices((i + 1) Mod 4)))
+    Next
+    ' Dimension endpoints after the closed loop exists; Inventor can reject isolated point dimensions.
+    For i As Integer = 0 To 3
+        Dim vertex As Inventor.SketchPoint = profileLines(i).StartSketchPoint
+        Dim x As Double = vertex.Geometry.X
+        Dim y As Double = vertex.Geometry.Y
+        Dim dx As Inventor.TwoPointDistanceDimConstraint = threadSketch.DimensionConstraints.AddTwoPointDistance(
+            origin, vertex, Inventor.DimensionOrientationEnum.kHorizontalDim, tg.CreatePoint2d(x / 2, y + p), False)
+        dx.Parameter.Expression = xExpressions(i)
+        Dim dy As Inventor.TwoPointDistanceDimConstraint = threadSketch.DimensionConstraints.AddTwoPointDistance(
+            origin, vertex, Inventor.DimensionOrientationEnum.kVerticalDim, tg.CreatePoint2d(x + p, y / 2), False)
+        dy.Parameter.Expression = yExpressions(i)
+    Next
+
+    ' Inventor evaluates rotation relative to the depth direction. False gives right-hand threads for both modes.
+    Dim clockwise As Boolean = False
+    Dim helix As Inventor.CoilFeature = partDef.Features.CoilFeatures.AddByPitchAndHeight(
+        threadSketch.Profiles.AddForSolid(), axis, prefix & "_P",
+        prefix & If(female, "_L", "_L + " & prefix & "_P"),
+        Inventor.PartFeatureOperationEnum.kCutOperation, Not naturalDepth, clockwise, "0 deg")
+    helix.Name = tag & "_Thread"
+    created.Add(helix)
+    threadSketch.Visible = False
+    If female Then
+        ' Remove the incomplete first turn and minor-diameter entrance ring.
+        ' This cylindrical guide allows the mating male crest to enter the threaded bore.
+        Dim entryDefinition As Inventor.ExtrudeDefinition = partDef.Features.ExtrudeFeatures.CreateExtrudeDefinition(
+            entrySketch.Profiles.AddForSolid(), Inventor.PartFeatureOperationEnum.kCutOperation)
+        entryDefinition.SetDistanceExtent(prefix & "_P",
+            If(extrudePositive, Inventor.PartFeatureExtentDirectionEnum.kPositiveExtentDirection,
+                Inventor.PartFeatureExtentDirectionEnum.kNegativeExtentDirection))
+        Dim entryRelief As Inventor.ExtrudeFeature = partDef.Features.ExtrudeFeatures.Add(entryDefinition)
+        entryRelief.Name = tag & "_EntryRelief"
+        created.Add(entryRelief)
+        entrySketch.Visible = False
+    End If
+End Sub
+
+Function SketchNormal(targetSketch As Inventor.PlanarSketch, tg As Inventor.TransientGeometry) As Inventor.UnitVector
+    Dim origin As Inventor.Point = targetSketch.SketchToModelSpace(tg.CreatePoint2d(0, 0))
+    Dim x As Inventor.Point = targetSketch.SketchToModelSpace(tg.CreatePoint2d(1, 0))
+    Dim y As Inventor.Point = targetSketch.SketchToModelSpace(tg.CreatePoint2d(0, 1))
+    Return origin.VectorTo(x).CrossProduct(origin.VectorTo(y)).AsUnitVector()
+End Function
+
+
+
+
+
+
+

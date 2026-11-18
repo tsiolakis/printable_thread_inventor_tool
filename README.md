@@ -1,11 +1,11 @@
 # Printable threads for Autodesk Inventor
 
-An iLogic rule for placing modeled, editable threads in a single-solid Inventor part. It creates either female threaded holes or male threaded studs at the hole-center points of a sketch on a planar face. The threads are real geometry suitable for STL export, rather than cosmetic thread annotations.
+An iLogic rule for placing editable threads in an Inventor part. It creates either female threaded holes or male threaded studs at the points of a sketch on a face of a solid. The threads are real Inventor features, editable and printable.
 
 ![Male threaded stud preview](images/Male_preview.png)
 ![Female threaded hole preview](images/Female_preview.png)
 
-The rule uses ordinary Inventor sketches, extrusions, coils, and parameters. The male option creates a **new stud** on the chosen face; it does not thread an existing shaft.
+The male option creates a **new stud** on the chosen face; it does not thread an existing shaft.
 
 ## Requirements
 
@@ -15,13 +15,13 @@ The rule uses ordinary Inventor sketches, extrusions, coils, and parameters. The
 
 ## Install and run
 
-1. Download or clone the repo (or use **Code → Download ZIP**) and keep `Place_Printable_Thread.iLogicVb` somewhere accessible.
+1. Download or clone the repo and keep `Place_Printable_Thread.iLogicVb` somewhere accessible.
 2. Open your target `.ipt` in Inventor. Create a 2D sketch on the face where the threads will go, add and dimension the hole-center points, then finish the sketch.
 3. Show **Manage → iLogic → iLogic Browser** if needed. In **External Rules**, right-click the top node, choose **Add External Rule**, and select `Place_Printable_Thread.iLogicVb`. You only need to add it again if you move the file or use another computer.
 4. Select the placement sketch by clicking its name in the model browser, then run the external rule. If you did not preselect it, the rule prompts you to pick a sketch.
 5. Choose **Female hole** or **Male stud** and enter the nominal diameter (`D`), pitch (`P`), requested length (`L`), and radial clearance (`C`) in millimeters.
 
-Every hole-center point in the chosen sketch gets a thread. To use different sizes or lengths, create separate placement sketches and run the rule separately for each group. Each run creates its own parameter set.
+Every point in the chosen sketch acts as the center of a newly added thread. To use different sizes or lengths, create separate placement sketches and run the rule separately for each group. Each run creates its own parameter set.
 
 ## Parameters and fit
 
@@ -36,15 +36,15 @@ Find the generated parameters under **Manage → Parameters**. The first run nor
 
 Set both `D` and `P` explicitly: changing the diameter does not automatically select a standard pitch. For a mating pair, use the same `D`, `P`, and right-handed thread direction. Choose the two lengths independently.
 
-Positive female `C` enlarges the internal thread; positive male `C` shrinks the external thread. The added radial gap of a pair is **female `C` + male `C`**, and the corresponding diameter difference is twice that value. For example, and as a suggested starting point for most thread pairs, female `C = 0.15 mm` and male `C = 0 mm` add 0.15 mm radial clearance (0.30 mm diametral difference). The suggested values are only a starting point: print a short test pair with your actual printer, material, orientation, and settings, then adjust the fit.
+Positive female `C` enlarges the internal thread; positive male `C` shrinks the external thread. The added radial gap of a pair is **female `C` + male `C`**, and the corresponding diameter difference is twice that value. For example, and as a suggested starting point for most thread pairs, female `C = 0.15 mm` and male `C = 0 mm` add 0.15 mm radial clearance (0.30 mm diametral difference).
 
 ### Female hole depth
 
-The rule cuts a pilot hole to **`L + P`** to allow thread runout. It also makes a straight, unthreaded entrance relief one pitch deep at the internal thread's major radius. For `L = 12 mm` and `P = 1.75 mm`, the pilot extends 13.75 mm before any retained floor. Provide additional stock thickness for a blind bottom. The full-profile engagement is shorter than `L` because of the entrance and end geometry; if the cut reaches the opposite face, the hole becomes a through opening.
+The rule cuts a hole to **`L + P`** to allow thread margin. It also makes a straight, unthreaded entrance relief one pitch deep at the internal thread's major radius. For `L = 12 mm` and `P = 1.75 mm`, the hole extends 13.75 mm before any retained floor. If the cut reaches the opposite face, the hole becomes a through opening.
 
 ### Male stud geometry
 
-The boss projects outward from the selected face and joins the existing solid. The coil cut extends past the tip to complete its thread. There is no configurable shoulder, tip chamfer, or rounded runout. Check surrounding stock, stud spacing, and the actual mating geometry before printing.
+The stud projects outward from the selected face and joins the existing solid. The coil cut extends past the tip to complete its thread. There is no configurable shoulder or tip chamfer. Check surrounding stock, stud spacing, and the actual mating geometry before printing.
 
 ## Edit a placed thread
 
